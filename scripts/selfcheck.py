@@ -24,6 +24,7 @@ from app.integrity import (
     ZERO_DIGEST,
     canonical_event_bytes,
     chain_digest,
+    legacy_object_chain_digest,
 )
 from app.signing import (
     build_canonical_string,
@@ -293,10 +294,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # --- integrity hash chain ----------------------------------------------------
 
-# Canonical bytes are compact, key-sorted UTF-8 JSON of exactly the event.
-check("canonical event bytes",
+# Canonical bytes are compact, sorted-key UTF-8 JSON of the agreed
+# [stream_id, sequence, data] array (nested object keys sorted).
+check("canonical event bytes are an array",
       canonical_event_bytes("s", 2, {"z": 1, "a": "中"})
-      == b'{"data":{"a":"\xe4\xb8\xad","z":1},"sequence":2,"stream_id":"s"}')
+      == b'["s",2,{"a":"\xe4\xb8\xad","z":1}]')
 
 with tempfile.TemporaryDirectory() as tmp:
     store = NonceStore(os.path.join(tmp, "integrity.db"))
@@ -405,6 +407,14 @@ with tempfile.TemporaryDirectory() as tmp:
     d3 = chain_digest(d2, "s", 3, {"v": 3})
     check("legacy backfill from bound",
           migrated.stream_integrity("s") == (1, 3, d3, None))
+    # A zero-digest anchor row is planted at the positive bound.
+    conn = sqlite3.connect(db_path)
+    anchor = conn.execute(
+        "SELECT digest FROM stream_digests WHERE stream_id='s' AND sequence=1"
+    ).fetchone()
+    conn.close()
+    check("legacy backfill plants zero anchor at bound",
+          anchor is not None and bytes(anchor[0]) == ZERO_DIGEST)
     # Lease and consumption progress survived untouched.
     check("legacy lease survives upgrade",
           migrated.acknowledge_lease("s", "legacy-token", now=ts + 1)
@@ -413,6 +423,115 @@ with tempfile.TemporaryDirectory() as tmp:
           migrated.compact_stream("s", 0) == ("ok", 1, 2))
     check("legacy upgrade runs once",
           NonceStore(db_path).stream_integrity("s") == (1, 3, d3, None))
+
+# --- object-encoding migration ----------------------------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    from app.db import IntegrityChainError
+
+    db_path = os.path.join(tmp, "object-format.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE used_nonces (nonce TEXT PRIMARY KEY, method TEXT NOT NULL,
+            path TEXT NOT NULL, seen_at INTEGER NOT NULL);
+        CREATE TABLE stream_events (stream_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            data_json TEXT NOT NULL, nonce TEXT NOT NULL, seen_at INTEGER NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+        CREATE TABLE stream_watermarks (stream_id TEXT PRIMARY KEY,
+            high_water INTEGER NOT NULL CHECK (high_water >= 0));
+        CREATE TABLE stream_consumers (stream_id TEXT PRIMARY KEY,
+            confirmed_seq INTEGER NOT NULL CHECK (confirmed_seq >= 0));
+        CREATE TABLE stream_leases (stream_id TEXT PRIMARY KEY,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            token TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL);
+        CREATE TABLE stream_compactions (stream_id TEXT PRIMARY KEY,
+            compacted_until INTEGER NOT NULL CHECK (compacted_until >= 0));
+        CREATE TABLE stream_digests (stream_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            digest BLOB NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+    """)
+    # Uncompacted stream u with 2 opened events, object-encoded links.
+    for seq in (1, 2):
+        conn.execute("INSERT INTO stream_events VALUES (?,?,?,?,?)",
+                     ("u", seq, json.dumps({"v": seq}, separators=(",", ":")),
+                      f"u{seq}", ts))
+    conn.execute("INSERT INTO stream_watermarks VALUES ('u', 2)")
+    previous = ZERO_DIGEST
+    for seq in (1, 2):
+        previous = legacy_object_chain_digest(previous, "u", seq, {"v": seq})
+        conn.execute("INSERT INTO stream_digests VALUES (?,?,?)",
+                     ("u", seq, previous))
+    # Compacted stream c: bound 1, retained event 2, genuine old anchor.
+    conn.execute("INSERT INTO stream_events VALUES (?,?,?,?,?)",
+                 ("c", 2, json.dumps({"v": 2}, separators=(",", ":")),
+                  "c2", ts))
+    conn.execute("INSERT INTO stream_watermarks VALUES ('c', 2)")
+    conn.execute("INSERT INTO stream_consumers VALUES ('c', 2)")
+    conn.execute("INSERT INTO stream_compactions VALUES ('c', 1)")
+    anchor = legacy_object_chain_digest(ZERO_DIGEST, "c", 1, {"v": 1})
+    conn.execute("INSERT INTO stream_digests VALUES (?,?,?)",
+                 ("c", 1, anchor))
+    conn.execute("INSERT INTO stream_digests VALUES (?,?,?)",
+                 ("c", 2, legacy_object_chain_digest(
+                     anchor, "c", 2, {"v": 2})))
+    conn.commit()
+    conn.close()
+
+    migrated = NonceStore(db_path)
+    u2 = chain_digest(
+        chain_digest(ZERO_DIGEST, "u", 1, {"v": 1}), "u", 2, {"v": 2})
+    check("object chain migrated to array encoding",
+          migrated.stream_integrity("u") == (0, 2, u2, None))
+    check("compacted migration plants zero anchor and covers retained only",
+          migrated.stream_integrity("c")
+          == (1, 2, chain_digest(ZERO_DIGEST, "c", 2, {"v": 2}), None))
+    check("migration runs once",
+          NonceStore(db_path).stream_integrity("u") == (0, 2, u2, None))
+
+    # A corrupted object chain must abort startup, never be rewritten.
+    bad_path = os.path.join(tmp, "object-corrupt.db")
+    conn = sqlite3.connect(bad_path)
+    conn.executescript("""
+        CREATE TABLE used_nonces (nonce TEXT PRIMARY KEY, method TEXT NOT NULL,
+            path TEXT NOT NULL, seen_at INTEGER NOT NULL);
+        CREATE TABLE stream_events (stream_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            data_json TEXT NOT NULL, nonce TEXT NOT NULL, seen_at INTEGER NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+        CREATE TABLE stream_watermarks (stream_id TEXT PRIMARY KEY,
+            high_water INTEGER NOT NULL CHECK (high_water >= 0));
+        CREATE TABLE stream_consumers (stream_id TEXT PRIMARY KEY,
+            confirmed_seq INTEGER NOT NULL CHECK (confirmed_seq >= 0));
+        CREATE TABLE stream_leases (stream_id TEXT PRIMARY KEY,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            token TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL);
+        CREATE TABLE stream_compactions (stream_id TEXT PRIMARY KEY,
+            compacted_until INTEGER NOT NULL CHECK (compacted_until >= 0));
+        CREATE TABLE stream_digests (stream_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            digest BLOB NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+    """)
+    conn.execute("INSERT INTO stream_events VALUES (?,?,?,?,?)",
+                 ("s", 1, "{}", "s1", ts))
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 1)")
+    conn.execute("INSERT INTO stream_digests VALUES (?,?,?)",
+                 ("s", 1, b"\x77" * 32))
+    conn.commit()
+    conn.close()
+    try:
+        NonceStore(bad_path)
+        check("corrupt old chain aborts startup", False)
+    except IntegrityChainError:
+        check("corrupt old chain aborts startup", True)
+    # Bad bytes still in place after the refused migration.
+    conn = sqlite3.connect(bad_path)
+    untouched = conn.execute(
+        "SELECT digest FROM stream_digests WHERE stream_id='s' AND sequence=1"
+    ).fetchone()[0]
+    conn.close()
+    check("corrupt old chain is not rewritten", untouched == b"\x77" * 32)
 
 print()
 if failures:

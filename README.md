@@ -9,13 +9,15 @@
 已确认的事件前缀还可以**按流清理（compact）**：删除前缀事件并持久化一个只增
 不减的清理界限，读取到已清理区间时返回 `410` 指引客户端从界限处续读。每条已
 开放事件还串有一条 **SHA-256 完整性摘要链**：乱序暂存不生成摘要，缺口补齐、
-序号开放时按序把前一摘要与事件的紧凑 JSON 拼接求摘要；可通过
+序号开放时按序把前一摘要的原始 32 字节与事件的紧凑 JSON **数组**
+`[stream_id,sequence,data]` 拼接求摘要；可通过
 `GET /streams/{id}/integrity` 在单个 SQLite 快照内重算校验。
 
 - 框架：FastAPI + Uvicorn
 - 存储：SQLite（WAL 模式，原子登记 nonce，事件与水位单事务推进，租约、已确认
-  序号、清理界限与完整性摘要落库保存，重启后数据仍然有效；旧版数据库首次启动
-  时自动补建摘要链，不丢失事件、租约与消费进度）
+  序号、清理界限与完整性摘要落库保存，重启后数据仍然有效；启动时自动补建
+  摘要链，并把旧版对象编码链先核验再迁移为约定的数组编码，不丢失事件、
+  nonce、租约与消费进度）
 - 一条命令启动，默认地址 <http://localhost:8000>，交互式文档 <http://localhost:8000/docs>
 
 ## 快速开始（Docker Compose）
@@ -530,25 +532,69 @@ curl -s -X POST http://localhost:8000/streams/orders-42/claim
 - 缺口补齐、若干序号在一次水位推进中开放时，按序号从小到大依次计算
   `摘要(n) = SHA-256( 前一摘要原始 32 字节 ‖ 事件的 UTF-8 紧凑 JSON )`，
   与事件写入、水位推进在**同一个 `BEGIN IMMEDIATE` 事务**内落库；链首
-  （序号 1，或清理界限之后的第一条）使用 **32 个零字节**作为前一摘要。
-- 被拼接的事件 JSON 固定为对象 `{"stream_id", "sequence", "data"}`，
-  **对象键排序**（嵌套对象同样排序）、无多余空白（紧凑格式）、非 ASCII 字符
-  按 UTF-8 直接编码。摘要以原始 32 字节保存，接口以小写十六进制（64 字符）
-  返回。
+  （序号 1）使用 **32 个零字节**作为前一摘要。
+- 被拼接的事件 JSON 固定为**数组 `[stream_id, sequence, data]`**（按此固定
+  顺序，不是投递接口所用的三键对象），**无多余空白（紧凑格式）**；`data`
+  内部的对象键仍按字典序排序（嵌套对象同样排序），非 ASCII 字符按 UTF-8
+  直接编码。摘要以原始 32 字节保存，接口以小写十六进制（64 字符）返回。
+
+  计算示例（Python 标准库）：
+
+  ```python
+  import hashlib, json
+
+  ZERO = b"\x00" * 32
+  event_bytes = json.dumps(
+      ["orders-42", 1, {"z": 1, "a": "中"}],
+      ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+  ).encode("utf-8")
+  # -> b'["orders-42",1,{"a":"\xe4\xb8\xad","z":1}]'
+  digest_1 = hashlib.sha256(ZERO + event_bytes).digest()
+
+  event_2 = json.dumps(
+      ["orders-42", 2, {"v": 2}],
+      ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+  ).encode("utf-8")
+  digest_2 = hashlib.sha256(digest_1 + event_2).digest()
+  ```
+
+  注意外层是**数组**：`json.dumps({"stream_id": ..., "sequence": ...,
+  "data": ...}, sort_keys=True)` 得到的三键对象不是链输入，用它重算会得到
+  不同的摘要。
 - **compact 原子保留界限处摘要作为锚点**：删除前缀事件时只删除
   `sequence < 新界限` 的摘要，`sequence = 界限` 的摘要保留为链锚点
   （界限为 `0` 时不删除任何摘要）；界限之后的新事件与所有校验都从该锚点
   续接，即使锚点对应的事件本身已被删除。
-- **旧数据库自动升级**：升级到本特性后的服务首次启动时，以每条流现有清理
-  界限为零摘要起点，为界限之上、已开放且仍保留的事件按序补建摘要链；
-  事件、租约、已确认序号与清理界限均原样保留。
+- **校验只能覆盖保留区间**：compact 之后，序号 `≤ compacted_until` 的事件
+  已被物理删除，`/integrity` 的重算**只覆盖 `(compacted_until,
+  watermark]` 这段仍保留的事件**，从界限处保留的锚点摘要出发。锚点之前的
+  已删除前缀无法重放，也不在校验范围内；客户端续读/外部对账时同样只能对
+  保留区间求链。
+- **旧数据库自动升级（两种情况）**，均在启动时完成：
+  - 早于摘要特性的数据库：以每条流现有清理界限为起点（正界限处先写入
+    **零摘要锚点**），为界限之上、已开放且仍保留的事件按当前数组编码补建
+    摘要链；
+  - 曾用错误的**三键对象**编码写过摘要链的数据库：启动时先在单个 SQLite
+    写事务内**按旧对象编码完整核验旧链**（含界限处锚点与保留区间逐环比对），
+    全部通过后才在**同一个事务**里把摘要按数组编码重写，并把
+    `schema_meta` 中的格式标记翻到 `array-v1`。
+- **旧链损坏绝不静默重写**：核验发现任何缺失/多余的摘要行、事件行缺失或
+  摘要不符，启动直接失败（`IntegrityChainError`），数据库原样保留，修复后
+    重启即可重新迁移。
+- **已清理流的迁移边界**：已删除前缀无法重建，迁移时在清理界限处放置
+  **零摘要新锚点**，只重算保留事件；这意味着迁移后的锚点不再是删除前缀的
+  链尾，校验范围明确限定为保留区间。
+- **中断安全**：迁移是单事务，提交前崩溃/中断后重启会整体重试；事件、
+  nonce、租约、水位、已确认进度与清理界限均不丢失、不改动。
 
 ### `GET /streams/{stream_id}/integrity`
 
 在**同一个 SQLite 只读快照**内，从清理锚点（界限处保留的摘要；界限为 `0`
-时为 32 个零字节）出发，对界限之上到水位为止的事件逐条重算 SHA-256 链接并与
-库里保存的摘要比对。**未知流返回空链**（界限与水位为 `0`、链尾为 64 个 `0`、
-无异常序号）；只有暂存事件（水位仍为 `0`）的流同样返回空链。
+时为 32 个零字节；已清理流的迁移锚点为界限处的 32 个零字节）出发，对界限
+之上到水位为止的**保留事件**逐条重算 SHA-256 链接并与库里保存的摘要比对，
+**校验范围仅限 `(compacted_until, watermark]`**。未知流返回空链（界限与水位
+为 `0`、链尾为 64 个 `0`、无异常序号）；只有暂存事件（水位仍为 `0`）的流
+同样返回空链。
 
 ```bash
 curl -s http://localhost:8000/streams/orders-42/integrity
@@ -728,7 +774,7 @@ app/
   __init__.py
   signing.py   # 百分号编码、规范化字符串、HMAC 计算与恒定时间比对（纯标准库）
   events.py    # 签名 body 字符串解析为 {stream_id, sequence, data} 事件
-  integrity.py # 事件紧凑 JSON 规范化与 SHA-256 摘要链接（纯标准库）
+  integrity.py # 事件紧凑 JSON 数组规范化与 SHA-256 摘要链接（纯标准库）
   db.py        # SQLite：nonce 原子登记、事件暂存、水位推进、摘要链、租约领取/确认、前缀清理
   main.py      # FastAPI：/verify、/streams/events、/ready、/integrity、/claim、/ack、/compact、/health
 tests/         # pytest 单元与端到端测试（TestClient，含并发补号、并发领取/确认、旧库升级）
@@ -736,7 +782,7 @@ scripts/
   example_client.py    # 签名并调用 /verify 的演示客户端
   example_streams.py   # 乱序暂存 / 补号 / 重复序号的流演示客户端
   example_claims.py    # 领取 / 确认 / 超时换令牌重领的消费演示客户端
-  selfcheck.py         # 纯标准库核心逻辑自检（含摘要链与旧库升级）
+  selfcheck.py         # 纯标准库核心逻辑自检（含摘要链、旧库补建与对象编码迁移）
 Dockerfile
 docker-compose.yml  # 端口仅绑定 127.0.0.1:8000
 requirements.txt / requirements-dev.txt
