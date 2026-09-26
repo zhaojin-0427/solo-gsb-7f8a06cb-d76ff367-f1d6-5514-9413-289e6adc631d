@@ -11,12 +11,15 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import NonceStore
+from app.db import ChainCorruptionError, NonceStore
 from app.integrity import (
+    DIGEST_FORMAT_ARRAY_V2,
     DIGEST_LEN,
     ZERO_DIGEST,
     canonical_event_bytes,
     chain_digest,
+    legacy_chain_digest,
+    legacy_object_event_bytes,
 )
 from app.main import app
 from app.signing import build_canonical_string
@@ -29,16 +32,16 @@ def test_zero_digest_is_32_zero_bytes():
 
 def test_canonical_event_bytes_are_compact_sorted_utf8():
     raw = canonical_event_bytes("s1", 7, {"z": 1, "a": [1, 2], "中": "文"})
-    # Top-level and nested object keys are sorted; no whitespace; non-ASCII
-    # is emitted as raw UTF-8 bytes.
+    # The top level is the [stream_id, sequence, data] array (no keys);
+    # nested object keys are sorted; no whitespace; non-ASCII is emitted
+    # as raw UTF-8 bytes.
     assert raw == (
-        b'{"data":{"a":[1,2],"z":1,"\xe4\xb8\xad":"\xe6\x96\x87"},'
-        b'"sequence":7,"stream_id":"s1"}'
+        b'["s1",7,{"a":[1,2],"z":1,"\xe4\xb8\xad":"\xe6\x96\x87"}]'
     )
-    # And it is exactly json.dumps with the documented keyword arguments.
+    # And it is exactly json.dumps of the array with the documented
+    # keyword arguments.
     assert raw == json.dumps(
-        {"stream_id": "s1", "sequence": 7,
-         "data": {"z": 1, "a": [1, 2], "中": "文"}},
+        ["s1", 7, {"z": 1, "a": [1, 2], "中": "文"}],
         ensure_ascii=False, separators=(",", ":"), sort_keys=True,
     ).encode("utf-8")
 
@@ -46,9 +49,25 @@ def test_canonical_event_bytes_are_compact_sorted_utf8():
 def test_canonical_bytes_cover_every_json_data_shape():
     for data in (None, True, 42, 3.5, "str", [1, 2], {"n": {"x": [True, None]}}):
         assert canonical_event_bytes("s", 1, data) == json.dumps(
-            {"data": data, "sequence": 1, "stream_id": "s"},
+            ["s", 1, data],
             ensure_ascii=False, separators=(",", ":"), sort_keys=True,
         ).encode("utf-8")
+
+
+def test_legacy_object_event_bytes_keep_the_old_object_shape():
+    # The pre-fix encoding hashed the three-key object; it is retained
+    # only for verifying stored legacy chains during the migration.
+    assert legacy_object_event_bytes("s1", 7, {"z": 1, "a": "中"}) == (
+        b'{"data":{"a":"\xe4\xb8\xad","z":1},"sequence":7,'
+        b'"stream_id":"s1"}'
+    )
+    # The two encodings must never collide for the same event.
+    assert legacy_object_event_bytes("s1", 7, {}) != canonical_event_bytes(
+        "s1", 7, {}
+    )
+    assert legacy_chain_digest(ZERO_DIGEST, "s", 1, {"v": 1}) != chain_digest(
+        ZERO_DIGEST, "s", 1, {"v": 1}
+    )
 
 
 def test_chain_digest_matches_independent_sha256_vector():
@@ -387,8 +406,11 @@ def test_legacy_database_is_backfilled_from_compaction_bound(tmp_path):
 
     store = NonceStore(path)  # construction runs the upgrade
 
-    # s: zero anchor at the bound, links only for retained opened 4,5.
-    assert [s for s, _ in _digest_rows(path, "s")] == [4, 5]
+    # s: an explicit zero-digest anchor row sits at the bound, followed
+    # by links for the retained opened events 4 and 5.
+    rows = _digest_rows(path, "s")
+    assert [sequence for sequence, _ in rows] == [3, 4, 5]
+    assert rows[0][1] == ZERO_DIGEST
     d4 = chain_digest(ZERO_DIGEST, "s", 4, {"v": 4})
     d5 = chain_digest(d4, "s", 5, {"v": 5})
     assert store.stream_integrity("s") == (3, 5, d5, None)
@@ -447,6 +469,304 @@ def test_legacy_upgrade_with_gap_in_retained_events_stops_chain(tmp_path):
     assert tail == chain_digest(
         chain_digest(ZERO_DIGEST, "s", 1, {"v": 1}), "s", 2, {"v": 2}
     )
+
+
+# --- object-format chain migration -------------------------------------------
+
+
+def _create_object_format_database(path):
+    """Create a database as the pre-fix code would have left it.
+
+    Identical schema to the current one minus the ``app_meta`` table
+    (the pre-fix code recorded no format marker); digests must be added
+    with :func:`_legacy_chain` so they use the object encoding.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE used_nonces (
+            nonce TEXT PRIMARY KEY, method TEXT NOT NULL,
+            path TEXT NOT NULL, seen_at INTEGER NOT NULL);
+        CREATE TABLE stream_events (
+            stream_id TEXT NOT NULL, sequence INTEGER NOT NULL
+                CHECK (sequence >= 1),
+            data_json TEXT NOT NULL, nonce TEXT NOT NULL, seen_at INTEGER NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+        CREATE TABLE stream_watermarks (
+            stream_id TEXT PRIMARY KEY,
+            high_water INTEGER NOT NULL CHECK (high_water >= 0));
+        CREATE TABLE stream_consumers (
+            stream_id TEXT PRIMARY KEY,
+            confirmed_seq INTEGER NOT NULL CHECK (confirmed_seq >= 0));
+        CREATE TABLE stream_leases (
+            stream_id TEXT PRIMARY KEY,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            token TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL);
+        CREATE TABLE stream_compactions (
+            stream_id TEXT PRIMARY KEY,
+            compacted_until INTEGER NOT NULL CHECK (compacted_until >= 0));
+        CREATE TABLE stream_digests (
+            stream_id TEXT NOT NULL, sequence INTEGER NOT NULL
+                CHECK (sequence >= 1),
+            digest BLOB NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+        """
+    )
+    return conn
+
+
+def _insert_event(conn, stream_id, sequence, data):
+    conn.execute(
+        "INSERT INTO stream_events VALUES (?,?,?,?,?)",
+        (
+            stream_id,
+            sequence,
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            f"n-{stream_id}-{sequence}",
+            1,
+        ),
+    )
+
+
+def _legacy_chain(conn, stream_id, sequences, previous=ZERO_DIGEST):
+    """Append object-format digest rows for *sequences*; return the tail."""
+    for sequence in sequences:
+        (data_json,) = conn.execute(
+            "SELECT data_json FROM stream_events "
+            "WHERE stream_id = ? AND sequence = ?",
+            (stream_id, sequence),
+        ).fetchone()
+        previous = legacy_chain_digest(
+            previous, stream_id, sequence, json.loads(data_json)
+        )
+        conn.execute(
+            "INSERT INTO stream_digests VALUES (?,?,?)",
+            (stream_id, sequence, previous),
+        )
+    return previous
+
+
+def _format_marker(path):
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_meta WHERE key = 'digest_format'"
+        ).fetchone()
+        return row[0] if row is not None else None
+    finally:
+        conn.close()
+
+
+def test_object_format_chains_are_reencoded_at_startup(tmp_path):
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 4):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 3)")
+    _legacy_chain(conn, "s", (1, 2, 3))
+    conn.commit()
+    # Sanity: the stored object-format links differ from the array ones.
+    assert _digest_rows(path, "s")[0][1] == legacy_chain_digest(
+        ZERO_DIGEST, "s", 1, {"v": 1}
+    )
+    conn.close()
+
+    store = NonceStore(path)  # startup verifies, then re-encodes
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+
+    # An uncompacted stream is recomputed from its first item.
+    expected = ZERO_DIGEST
+    for i in (1, 2, 3):
+        expected = chain_digest(expected, "s", i, {"v": i})
+    assert [digest for _, digest in _digest_rows(path, "s")] == [
+        chain_digest(ZERO_DIGEST, "s", 1, {"v": 1}),
+        chain_digest(
+            chain_digest(ZERO_DIGEST, "s", 1, {"v": 1}), "s", 2, {"v": 2}
+        ),
+        expected,
+    ]
+    assert store.stream_integrity("s") == (0, 3, expected, None)
+
+
+def test_migration_reanchors_compacted_stream_with_zero_digest(tmp_path):
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    # Opened 1..5, confirmed 1..3, compacted through 3: the old compact
+    # kept the object-format digest AT 3 as the anchor.
+    for i in range(1, 6):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 5)")
+    conn.execute("INSERT INTO stream_consumers VALUES ('s', 3)")
+    _legacy_chain(conn, "s", (1, 2, 3, 4, 5))
+    conn.execute("DELETE FROM stream_events WHERE stream_id='s' AND sequence<=3")
+    conn.execute("DELETE FROM stream_digests WHERE stream_id='s' AND sequence<3")
+    conn.execute("INSERT INTO stream_compactions VALUES ('s', 3)")
+    conn.commit()
+    conn.close()
+
+    store = NonceStore(path)
+
+    # The deleted prefix cannot be recomputed, so the bound now carries
+    # an explicit zero-digest anchor and only the retained interval
+    # (3, 5] is chained from it.
+    rows = _digest_rows(path, "s")
+    assert [sequence for sequence, _ in rows] == [3, 4, 5]
+    assert rows[0][1] == ZERO_DIGEST
+    d4 = chain_digest(ZERO_DIGEST, "s", 4, {"v": 4})
+    d5 = chain_digest(d4, "s", 5, {"v": 5})
+    assert store.stream_integrity("s") == (3, 5, d5, None)
+
+    # New gap fills continue from the re-anchored tail in array format.
+    assert store.store_stream_event(
+        nonce="n6", method="POST", path="/p", now=2,
+        stream_id="s", sequence=6, data={"v": 6},
+    ) == ("ok", [6], 6)
+    assert store.stream_integrity("s") == (
+        3, 6, chain_digest(d5, "s", 6, {"v": 6}), None,
+    )
+
+
+def test_migration_preserves_events_nonces_leases_and_cursors(tmp_path):
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 6):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 5)")
+    conn.execute("INSERT INTO stream_consumers VALUES ('s', 3)")
+    conn.execute(
+        "INSERT INTO stream_leases VALUES ('s', 4, 'pending-token', 9999999999)"
+    )
+    conn.execute(
+        "INSERT INTO used_nonces VALUES ('spent', 'POST', '/streams/events', 1)"
+    )
+    _legacy_chain(conn, "s", (1, 2, 3, 4, 5))
+    conn.execute("DELETE FROM stream_events WHERE stream_id='s' AND sequence<=3")
+    conn.execute("DELETE FROM stream_digests WHERE stream_id='s' AND sequence<3")
+    conn.execute("INSERT INTO stream_compactions VALUES ('s', 3)")
+    # A buffered event behind a gap on another stream must survive too.
+    _insert_event(conn, "g", 9, {"v": 9})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('g', 0)")
+    conn.commit()
+    conn.close()
+
+    store = NonceStore(path)
+
+    # Nonce registry, lease, confirmed cursor, watermark and bound all
+    # survived the migration untouched.
+    assert store.register("spent", "POST", "/streams/events", 2) is False
+    assert store.acknowledge_lease("s", "pending-token", now=1_700_000_100) == (
+        "acknowledged", 4,
+    )
+    compacted, watermark, events = store.ready_events("s", after_seq=3)
+    assert (compacted, watermark) == (3, 5)
+    assert [event["sequence"] for event in events] == [4, 5]
+    assert store.compact_stream("s", 1) == ("ok", 3, 4)
+    assert store.ready_events("g", 0) == (0, 0, [])
+    assert _digest_rows(path, "g") == []
+
+
+def test_migration_refuses_to_rewrite_a_corrupted_chain(tmp_path):
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 4):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 3)")
+    _legacy_chain(conn, "s", (1, 2, 3))
+    # Corrupt one link of the legacy chain.
+    conn.execute(
+        "UPDATE stream_digests SET digest = ? "
+        "WHERE stream_id = 's' AND sequence = 2",
+        (b"\xff" * 32,),
+    )
+    conn.commit()
+    before = _digest_rows(path, "s")
+    conn.close()
+
+    with pytest.raises(ChainCorruptionError) as excinfo:
+        NonceStore(path)
+    assert "'s'" in str(excinfo.value) and "sequence 2" in str(excinfo.value)
+
+    # Nothing was silently rewritten: digests are byte-identical and no
+    # format marker was committed.
+    assert _digest_rows(path, "s") == before
+    assert _format_marker(path) is None
+
+    # The failure is not sticky: repair the link externally and the next
+    # start migrates normally.
+    conn = sqlite3.connect(path)
+    fixed = legacy_chain_digest(
+        legacy_chain_digest(ZERO_DIGEST, "s", 1, {"v": 1}), "s", 2, {"v": 2}
+    )
+    conn.execute(
+        "UPDATE stream_digests SET digest = ? "
+        "WHERE stream_id = 's' AND sequence = 2",
+        (fixed,),
+    )
+    conn.commit()
+    conn.close()
+    store = NonceStore(path)
+    assert store.stream_integrity("s")[3] is None
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+
+
+def test_migration_flags_a_malformed_anchor_row(tmp_path):
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 4):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 3)")
+    conn.execute("INSERT INTO stream_consumers VALUES ('s', 1)")
+    _legacy_chain(conn, "s", (1, 2, 3))
+    conn.execute("DELETE FROM stream_events WHERE stream_id='s' AND sequence<=1")
+    conn.execute("DELETE FROM stream_digests WHERE stream_id='s' AND sequence<1")
+    conn.execute("INSERT INTO stream_compactions VALUES ('s', 1)")
+    # A truncated (16-byte) blob where the anchor digest should be.
+    conn.execute(
+        "UPDATE stream_digests SET digest = ? "
+        "WHERE stream_id = 's' AND sequence = 1",
+        (b"\x07" * 16,),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ChainCorruptionError):
+        NonceStore(path)
+    assert _format_marker(path) is None
+
+
+def test_migration_is_idempotent_across_restarts(tmp_path):
+    path = str(tmp_path / "v1.db")
+    conn = _create_object_format_database(path)
+    for i in range(1, 3):
+        _insert_event(conn, "s", i, {"v": i})
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 2)")
+    _legacy_chain(conn, "s", (1, 2))
+    conn.commit()
+    conn.close()
+
+    NonceStore(path)
+    migrated_rows = _digest_rows(path, "s")
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+
+    # A second startup is a no-op: same digests, same marker, chain
+    # still verifies.
+    reopened = NonceStore(path)
+    assert _digest_rows(path, "s") == migrated_rows
+    assert _format_marker(path) == DIGEST_FORMAT_ARRAY_V2
+    assert reopened.stream_integrity("s")[3] is None
+
+
+def test_unrecognised_format_marker_refuses_startup(tmp_path):
+    path = str(tmp_path / "v9.db")
+    NonceStore(path)  # fresh database gets the array-v2 marker
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE app_meta SET value = 'array-v9' WHERE key = 'digest_format'"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(RuntimeError, match="unrecognised digest_format"):
+        NonceStore(path)
 
 
 # --- HTTP endpoint -----------------------------------------------------------

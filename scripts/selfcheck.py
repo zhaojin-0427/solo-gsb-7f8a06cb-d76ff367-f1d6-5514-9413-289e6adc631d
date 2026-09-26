@@ -18,12 +18,14 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.db import NonceStore
+from app.db import ChainCorruptionError, NonceStore
 from app.events import EventBodyError, parse_event_body
 from app.integrity import (
+    DIGEST_FORMAT_ARRAY_V2,
     ZERO_DIGEST,
     canonical_event_bytes,
     chain_digest,
+    legacy_chain_digest,
 )
 from app.signing import (
     build_canonical_string,
@@ -293,10 +295,14 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # --- integrity hash chain ----------------------------------------------------
 
-# Canonical bytes are compact, key-sorted UTF-8 JSON of exactly the event.
+# Canonical bytes are the compact UTF-8 JSON of the [stream_id, sequence,
+# data] array, with nested object keys sorted.
 check("canonical event bytes",
       canonical_event_bytes("s", 2, {"z": 1, "a": "中"})
-      == b'{"data":{"a":"\xe4\xb8\xad","z":1},"sequence":2,"stream_id":"s"}')
+      == b'["s",2,{"a":"\xe4\xb8\xad","z":1}]')
+check("legacy object bytes differ",
+      legacy_chain_digest(ZERO_DIGEST, "s", 2, {"z": 1, "a": "中"})
+      != chain_digest(ZERO_DIGEST, "s", 2, {"z": 1, "a": "中"}))
 
 with tempfile.TemporaryDirectory() as tmp:
     store = NonceStore(os.path.join(tmp, "integrity.db"))
@@ -405,6 +411,18 @@ with tempfile.TemporaryDirectory() as tmp:
     d3 = chain_digest(d2, "s", 3, {"v": 3})
     check("legacy backfill from bound",
           migrated.stream_integrity("s") == (1, 3, d3, None))
+    conn = sqlite3.connect(db_path)
+    anchor_row = conn.execute(
+        "SELECT digest FROM stream_digests WHERE stream_id='s' AND sequence=1"
+    ).fetchone()
+    marker_row = conn.execute(
+        "SELECT value FROM app_meta WHERE key='digest_format'"
+    ).fetchone()
+    conn.close()
+    check("legacy backfill sets zero anchor at bound",
+          anchor_row is not None and anchor_row[0] == ZERO_DIGEST)
+    check("backfill records the array format marker",
+          marker_row is not None and marker_row[0] == DIGEST_FORMAT_ARRAY_V2)
     # Lease and consumption progress survived untouched.
     check("legacy lease survives upgrade",
           migrated.acknowledge_lease("s", "legacy-token", now=ts + 1)
@@ -413,6 +431,91 @@ with tempfile.TemporaryDirectory() as tmp:
           migrated.compact_stream("s", 0) == ("ok", 1, 2))
     check("legacy upgrade runs once",
           NonceStore(db_path).stream_integrity("s") == (1, 3, d3, None))
+
+# --- object-format chain migration -------------------------------------------
+def build_object_format_db(db_path, corrupt=False):
+    """A database as the pre-fix code left it: object-encoding digests
+    and no app_meta marker table."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE used_nonces (nonce TEXT PRIMARY KEY, method TEXT NOT NULL,
+            path TEXT NOT NULL, seen_at INTEGER NOT NULL);
+        CREATE TABLE stream_events (stream_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            data_json TEXT NOT NULL, nonce TEXT NOT NULL, seen_at INTEGER NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+        CREATE TABLE stream_watermarks (stream_id TEXT PRIMARY KEY,
+            high_water INTEGER NOT NULL CHECK (high_water >= 0));
+        CREATE TABLE stream_consumers (stream_id TEXT PRIMARY KEY,
+            confirmed_seq INTEGER NOT NULL CHECK (confirmed_seq >= 0));
+        CREATE TABLE stream_leases (stream_id TEXT PRIMARY KEY,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            token TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL);
+        CREATE TABLE stream_compactions (stream_id TEXT PRIMARY KEY,
+            compacted_until INTEGER NOT NULL CHECK (compacted_until >= 0));
+        CREATE TABLE stream_digests (stream_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            digest BLOB NOT NULL,
+            PRIMARY KEY (stream_id, sequence));
+    """)
+    for seq in (1, 2, 3):
+        conn.execute("INSERT INTO stream_events VALUES (?,?,?,?,?)",
+                     ("s", seq, json.dumps({"v": seq}, separators=(",", ":")),
+                      f"o{seq}", ts))
+    conn.execute("INSERT INTO stream_watermarks VALUES ('s', 3)")
+    previous = ZERO_DIGEST
+    for seq in (1, 2, 3):
+        previous = legacy_chain_digest(previous, "s", seq, {"v": seq})
+        if corrupt and seq == 2:
+            previous = b"\xff" * 32
+        conn.execute("INSERT INTO stream_digests VALUES (?,?,?)",
+                     ("s", seq, previous))
+    conn.commit()
+    conn.close()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    db_path = os.path.join(tmp, "object-v1.db")
+    build_object_format_db(db_path)
+    migrated = NonceStore(db_path)
+    expected = ZERO_DIGEST
+    for seq in (1, 2, 3):
+        expected = chain_digest(expected, "s", seq, {"v": seq})
+    check("object-format chain re-encoded at startup",
+          migrated.stream_integrity("s") == (0, 3, expected, None))
+    conn = sqlite3.connect(db_path)
+    marker_row = conn.execute(
+        "SELECT value FROM app_meta WHERE key='digest_format'"
+    ).fetchone()
+    conn.close()
+    check("migration records the array format marker",
+          marker_row is not None and marker_row[0] == DIGEST_FORMAT_ARRAY_V2)
+    check("migration is idempotent on restart",
+          NonceStore(db_path).stream_integrity("s") == (0, 3, expected, None))
+
+with tempfile.TemporaryDirectory() as tmp:
+    db_path = os.path.join(tmp, "corrupt-v1.db")
+    build_object_format_db(db_path, corrupt=True)
+    conn = sqlite3.connect(db_path)
+    before = conn.execute(
+        "SELECT sequence, digest FROM stream_digests ORDER BY sequence"
+    ).fetchall()
+    conn.close()
+    try:
+        NonceStore(db_path)
+        check("corrupted legacy chain aborts startup", False)
+    except ChainCorruptionError:
+        check("corrupted legacy chain aborts startup", True)
+    conn = sqlite3.connect(db_path)
+    after = conn.execute(
+        "SELECT sequence, digest FROM stream_digests ORDER BY sequence"
+    ).fetchall()
+    marker_count = conn.execute(
+        "SELECT COUNT(*) FROM app_meta"
+    ).fetchone()[0]
+    conn.close()
+    check("corrupted chain left untouched (no silent rewrite)",
+          after == before and marker_count == 0)
 
 print()
 if failures:

@@ -34,13 +34,26 @@ Every opened event additionally carries a link of a SHA-256 *integrity
 chain* (see :mod:`app.integrity`): when a gap is filled and a run of
 sequences opens, each link is computed in sequence order from the
 previous digest (32 zero bytes for the chain's first link) and the
-event's canonical JSON. Events merely buffered behind a gap get no
-digest. When a prefix is compacted the digest *at* the new bound is
-atomically retained as the chain anchor, so later writes and checks
-continue from it. Databases created before this feature are upgraded at
-startup: each stream's retained, already-open events are chained from
-the existing compaction bound using a zero anchor, without touching
-events, leases or consumption progress.
+canonical JSON of the ``[stream_id, sequence, data]`` array. Events
+merely buffered behind a gap get no digest. When a prefix is compacted
+the digest *at* the new bound is atomically retained as the chain
+anchor, so later writes and checks continue from it.
+
+Two kinds of older databases are upgraded at startup, both without
+touching events, nonces, leases, watermarks or consumption progress:
+
+* databases created before integrity chaining existed get their
+  retained, already-open events chained from the existing compaction
+  bound using a zero anchor;
+* databases holding chains in the legacy *object* link encoding are
+  verified link by link and then re-encoded to the array encoding
+  inside a single write transaction (a zero-digest anchor is placed at
+  the compaction bound of already-compacted streams, whose deleted
+  prefix can no longer be recomputed). A legacy chain that fails
+  verification is never silently rewritten: startup aborts with
+  :class:`ChainCorruptionError` instead. The migration commits the
+  recomputed digests and the ``digest_format`` marker atomically, so an
+  interrupted migration is simply retried in full on the next start.
 """
 
 from __future__ import annotations
@@ -54,7 +67,14 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from .integrity import ZERO_DIGEST, chain_digest
+from .integrity import (
+    DIGEST_FORMAT_ARRAY_V2,
+    DIGEST_FORMAT_OBJECT_V1,
+    DIGEST_LEN,
+    ZERO_DIGEST,
+    chain_digest,
+    legacy_chain_digest,
+)
 
 # Result status of a transactional event submission.
 StoreStatus = Literal["ok", "replayed_nonce", "duplicate_sequence"]
@@ -72,6 +92,16 @@ CompactStatus = Literal["ok", "ahead_of_confirmed"]
 # lease expires another consumer may claim the same sequence, receiving a
 # fresh random token.
 LEASE_TTL_SECONDS = 30
+
+
+class ChainCorruptionError(RuntimeError):
+    """A stored legacy integrity chain failed its startup verification.
+
+    Raised when a database holding object-format chains contains a link
+    that does not recompute from the retained events. The store refuses
+    to start -- and leaves every digest untouched -- rather than
+    silently rewriting a corrupted chain into the new encoding.
+    """
 
 
 class NonceStore:
@@ -190,6 +220,23 @@ class NonceStore:
                 )
                 """
             )
+            # Key/value rows for database-wide bookkeeping; currently the
+            # 'digest_format' marker recording which link encoding the
+            # stored chains use (see app.integrity).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key    TEXT PRIMARY KEY,
+                    value  TEXT NOT NULL
+                )
+                """
+            )
+            digest_format = None
+            if not legacy_db:
+                row = conn.execute(
+                    "SELECT value FROM app_meta WHERE key = 'digest_format'"
+                ).fetchone()
+                digest_format = row[0] if row is not None else None
         if legacy_db:
             # Upgrade a database created before integrity chaining: build
             # the retained portion of every existing stream's chain from
@@ -197,6 +244,107 @@ class NonceStore:
             # bound. Events, watermarks, leases, consumers and compaction
             # bounds are all left untouched.
             self._backfill_legacy_chains()
+        elif digest_format is None or digest_format == DIGEST_FORMAT_OBJECT_V1:
+            # Chains exist in the legacy object encoding (databases that
+            # predate the marker have no row, which means the same):
+            # verify them, then re-encode to the array format.
+            self._migrate_object_chains_to_array()
+        elif digest_format != DIGEST_FORMAT_ARRAY_V2:
+            raise RuntimeError(
+                f"unrecognised digest_format marker {digest_format!r}; "
+                "refusing to start against an unknown chain encoding"
+            )
+
+    @staticmethod
+    def _compaction_bound(conn: sqlite3.Connection, stream_id: str) -> int:
+        """Current ``compacted_until`` of *stream_id* (0 when absent)."""
+        row = conn.execute(
+            "SELECT compacted_until FROM stream_compactions "
+            "WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()
+        return row[0] if row is not None else 0
+
+    @staticmethod
+    def _chain_streams(
+        conn: sqlite3.Connection,
+    ) -> List[Tuple[str, int]]:
+        """Every stream that may hold chain state, as ``(id, watermark)``.
+
+        The union of the watermark table and the digest table: the two
+        are written in the same transactions, but the union keeps the
+        startup upgrades correct even for a hand-assembled database.
+        """
+        streams: Dict[str, int] = {}
+        for stream_id, high_water in conn.execute(
+            "SELECT stream_id, high_water FROM stream_watermarks"
+        ):
+            streams[stream_id] = high_water
+        for (stream_id,) in conn.execute(
+            "SELECT DISTINCT stream_id FROM stream_digests"
+        ):
+            streams.setdefault(stream_id, 0)
+        return sorted(streams.items())
+
+    @staticmethod
+    def _write_format_marker(conn: sqlite3.Connection, value: str) -> None:
+        conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES ('digest_format', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (value,),
+        )
+
+    def _rebuild_retained_links(
+        self,
+        conn: sqlite3.Connection,
+        stream_id: str,
+        compacted_until: int,
+        high_water: int,
+    ) -> None:
+        """(Re)build one stream's retained chain in the array encoding.
+
+        Any existing digest rows of the stream are replaced. When the
+        stream was compacted, its deleted prefix can no longer be
+        recomputed, so an explicit zero-digest anchor row is placed at
+        the compaction bound and only the retained interval
+        ``(compacted_until, high_water]`` is chained from it; an
+        uncompacted stream is chained from sequence 1 with the same
+        zero "previous digest". Linking stops at the first physically
+        missing event row, exactly as live ingestion would.
+        """
+        conn.execute(
+            "DELETE FROM stream_digests WHERE stream_id = ?", (stream_id,)
+        )
+        previous = ZERO_DIGEST
+        if compacted_until > 0:
+            # Explicit zero anchor at the bound: verification of this
+            # stream can only ever cover the retained interval.
+            conn.execute(
+                "INSERT INTO stream_digests (stream_id, sequence, digest) "
+                "VALUES (?, ?, ?)",
+                (stream_id, compacted_until, ZERO_DIGEST),
+            )
+        sequence = compacted_until + 1
+        while sequence <= high_water:
+            row = conn.execute(
+                "SELECT data_json FROM stream_events "
+                "WHERE stream_id = ? AND sequence = ?",
+                (stream_id, sequence),
+            ).fetchone()
+            if row is None:
+                # First gap: nothing past it could have opened, so the
+                # chain legitimately ends here.
+                break
+            digest = chain_digest(
+                previous, stream_id, sequence, json.loads(row[0])
+            )
+            conn.execute(
+                "INSERT INTO stream_digests (stream_id, sequence, digest) "
+                "VALUES (?, ?, ?)",
+                (stream_id, sequence, digest),
+            )
+            previous = digest
+            sequence += 1
 
     def _backfill_legacy_chains(self) -> None:
         """Build integrity links for events retained by a pre-feature DB.
@@ -204,50 +352,135 @@ class NonceStore:
         For every known stream the existing compaction bound is treated
         as the chain frontier with a zero anchor; each retained event
         above the bound up to the committed watermark is linked in
-        sequence order. Sequences above a missing run (events that were
-        merely buffered behind a gap, or any physically missing row)
-        receive no link, exactly as a fresh ingestion would have done.
-        The whole rebuild is one write transaction per database.
+        sequence order using the current (array) encoding. Sequences
+        above a missing run (events that were merely buffered behind a
+        gap, or any physically missing row) receive no link, exactly as a
+        fresh ingestion would have done. The rebuild and the
+        ``digest_format`` marker commit as one write transaction, so a
+        crash midway simply re-runs the whole backfill on next start.
         """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            streams = conn.execute(
-                "SELECT stream_id, high_water FROM stream_watermarks"
-            ).fetchall()
-            for stream_id, high_water in streams:
-                compact_row = conn.execute(
-                    "SELECT compacted_until FROM stream_compactions "
-                    "WHERE stream_id = ?",
-                    (stream_id,),
-                ).fetchone()
-                compacted_until = compact_row[0] if compact_row is not None else 0
-                previous = ZERO_DIGEST
-                sequence = compacted_until + 1
-                while sequence <= high_water:
-                    row = conn.execute(
-                        "SELECT data_json FROM stream_events "
-                        "WHERE stream_id = ? AND sequence = ?",
-                        (stream_id, sequence),
-                    ).fetchone()
-                    if row is None:
-                        # First gap: nothing past it could have opened, so
-                        # the chain legitimately ends here.
-                        break
-                    digest = chain_digest(
-                        previous, stream_id, sequence, json.loads(row[0])
+            try:
+                for stream_id, high_water in self._chain_streams(conn):
+                    self._rebuild_retained_links(
+                        conn,
+                        stream_id,
+                        self._compaction_bound(conn, stream_id),
+                        high_water,
                     )
-                    conn.execute(
-                        "INSERT INTO stream_digests (stream_id, sequence, digest) "
-                        "VALUES (?, ?, ?)",
-                        (stream_id, sequence, digest),
+                self._write_format_marker(conn, DIGEST_FORMAT_ARRAY_V2)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+    def _verify_object_chain(
+        self, conn: sqlite3.Connection, stream_id: str, high_water: int
+    ) -> Optional[int]:
+        """First invalid sequence of a legacy object-format chain.
+
+        Replays the stored chain with the legacy encoding exactly the
+        way :meth:`stream_integrity` does for current chains: from the
+        retained anchor at the compaction bound (the zero digest when no
+        anchor row exists) over every retained event up to the
+        watermark. Returns ``None`` when every link verifies, otherwise
+        the sequence whose event/digest is missing or mismatched (or the
+        compaction bound itself when the retained anchor row is
+        malformed).
+        """
+        compacted_until = self._compaction_bound(conn, stream_id)
+        anchor_row = conn.execute(
+            "SELECT digest FROM stream_digests "
+            "WHERE stream_id = ? AND sequence = ?",
+            (stream_id, compacted_until),
+        ).fetchone()
+        if anchor_row is not None:
+            previous = bytes(anchor_row[0])
+            if len(previous) != DIGEST_LEN:
+                return compacted_until
+        else:
+            previous = ZERO_DIGEST
+        sequence = compacted_until + 1
+        while sequence <= high_water:
+            event_row = conn.execute(
+                "SELECT data_json FROM stream_events "
+                "WHERE stream_id = ? AND sequence = ?",
+                (stream_id, sequence),
+            ).fetchone()
+            if event_row is None:
+                return sequence
+            expected = legacy_chain_digest(
+                previous, stream_id, sequence, json.loads(event_row[0])
+            )
+            stored_row = conn.execute(
+                "SELECT digest FROM stream_digests "
+                "WHERE stream_id = ? AND sequence = ?",
+                (stream_id, sequence),
+            ).fetchone()
+            if stored_row is None or bytes(stored_row[0]) != expected:
+                return sequence
+            previous = expected
+            sequence += 1
+        return None
+
+    def _migrate_object_chains_to_array(self) -> None:
+        """Re-encode every stored object-format chain to the array format.
+
+        Phase 1 verifies every legacy chain inside one read-only
+        snapshot; any corruption aborts the startup with
+        :class:`ChainCorruptionError` and nothing is rewritten. Phase 2
+        recomputes all digests in the array encoding and writes the
+        ``digest_format`` marker inside a single ``BEGIN IMMEDIATE``
+        transaction, so an interrupted migration commits nothing and is
+        retried in full on the next start. Only the digest table and the
+        marker row are touched: events, nonces, leases, watermarks and
+        consumption progress are preserved by construction.
+        """
+        conn = self._connect()
+        try:
+            # 1) Verify before rewriting anything (read-only snapshot).
+            conn.execute("BEGIN")
+            try:
+                streams = self._chain_streams(conn)
+                corrupted = [
+                    (stream_id, bad)
+                    for stream_id, high_water in streams
+                    if (bad := self._verify_object_chain(
+                        conn, stream_id, high_water
+                    )) is not None
+                ]
+            finally:
+                conn.rollback()
+            if corrupted:
+                details = ", ".join(
+                    f"stream {stream_id!r} at sequence {sequence}"
+                    for stream_id, sequence in corrupted
+                )
+                raise ChainCorruptionError(
+                    "stored object-format integrity chain failed "
+                    f"verification ({details}); refusing to re-encode "
+                    "corrupted digests -- every digest was left untouched"
+                )
+
+            # 2) Recompute all digests + the marker in one transaction.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for stream_id, high_water in streams:
+                    self._rebuild_retained_links(
+                        conn,
+                        stream_id,
+                        self._compaction_bound(conn, stream_id),
+                        high_water,
                     )
-                    previous = digest
-                    sequence += 1
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+                self._write_format_marker(conn, DIGEST_FORMAT_ARRAY_V2)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             conn.close()
 

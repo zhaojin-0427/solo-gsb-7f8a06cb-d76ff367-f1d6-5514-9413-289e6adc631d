@@ -80,7 +80,9 @@ class IntegrityResponse(BaseModel):
         ...,
         description=(
             "Compaction bound the recomputation started from; its retained "
-            "digest is the chain anchor (32 zero bytes when the bound is 0)."
+            "digest is the chain anchor (32 zero bytes when the bound is 0, "
+            "or when a startup migration re-anchored the chain at the bound "
+            "because the compacted prefix could no longer be recomputed)."
         ),
     )
     watermark: int = Field(
@@ -237,7 +239,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Local Webhook Signature Verifier",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -451,12 +453,17 @@ async def stream_integrity(stream_id: str) -> IntegrityResponse:
     The check recomputes, inside one SQLite snapshot, every retained
     opened event's SHA-256 chain link starting from the compaction
     anchor (the digest at ``compacted_until``; 32 zero bytes at the
-    chain start) and compares it against the stored digest. The
-    response carries the compaction bound, the high-water mark, the
-    recomputed chain-tail digest (lowercase hex) and the first sequence
-    that is missing or whose digest does not match -- ``null`` when the
-    whole retained chain verifies. An unknown stream returns an empty
-    chain (zero tail digest and no invalid sequence).
+    chain start or at a migration-re-anchored bound) and compares it
+    against the stored digest. Each link hashes the previous digest's
+    raw 32 bytes concatenated with the compact JSON of the
+    ``[stream_id, sequence, data]`` array. The response carries the
+    compaction bound, the high-water mark, the recomputed chain-tail
+    digest (lowercase hex) and the first sequence that is missing or
+    whose digest does not match -- ``null`` when the whole retained
+    chain verifies. Verification can only cover the retained interval
+    ``(compacted_until, watermark]``: a compacted-away prefix is outside
+    the chain's reach. An unknown stream returns an empty chain (zero
+    tail digest and no invalid sequence).
     """
     compacted_until, watermark, tail_digest, first_invalid = (
         app.state.nonce_store.stream_integrity(stream_id)
